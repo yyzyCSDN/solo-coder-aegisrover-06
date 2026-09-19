@@ -16,6 +16,7 @@ from typing import Any
 
 from aegisrover.mission.lifecycle import InvalidTransition, MissionError, MissionService
 from aegisrover.mapping.revisions import MapFormatError, MapRepository, MapRevision
+from aegisrover.runtime.handover import PENDING, HandoverError, HandoverManager
 from aegisrover.runtime.session import SessionError, SessionRegistry
 from aegisrover.storage.audit import AuditLog
 from aegisrover.storage.event_store import EventStore
@@ -48,6 +49,7 @@ class PlatformService:
         self.audit = AuditLog(repository, clock)
         self.missions = MissionService(repository, self.audit, clock)
         self.sessions = SessionRegistry(repository, self.audit, clock)
+        self.handovers = HandoverManager(repository, self.sessions, self.missions, self.audit, clock)
         self.maps = MapRepository(repository, self.audit, clock)
         self.events = EventStore(repository, clock)
 
@@ -113,10 +115,67 @@ class PlatformService:
         except NotFound:
             raise ServiceError('session_not_found', f'unknown session {session_id}', 404) from None
 
+    # -- handover --------------------------------------------------------------
+    def offer_handover(self, robot: str, to_operator: str, *, actor: str, note: str = '',
+                       ttl_seconds: float = 900.0, idempotency_key: str | None = None) -> dict:
+        def action() -> dict:
+            handover = self.handovers.offer(robot, to_operator, actor=actor, note=note,
+                                            ttl_seconds=ttl_seconds)
+            return {'handover': handover.to_dict(), 'applied': True}
+
+        return self._idempotent(f'handover:offer:{robot}:{to_operator}', idempotency_key, action)
+
+    def accept_handover(self, handover_id: str, *, actor: str, lease_seconds: float = 30.0,
+                        idempotency_key: str | None = None) -> dict:
+        def action() -> dict:
+            try:
+                handover, session = self.handovers.accept(handover_id, actor=actor,
+                                                          lease_seconds=lease_seconds)
+            except NotFound:
+                raise ServiceError('handover_not_found',
+                                   f'unknown handover {handover_id}', 404) from None
+            # A fresh snapshot rides along so the new operator sees where every
+            # mission stands at the moment control actually changes hands.
+            return {'handover': handover.to_dict(), 'session': session.to_dict(),
+                    'snapshot': self.handovers.snapshot(handover.robot), 'applied': True}
+
+        return self._idempotent(f'handover:accept:{handover_id}', idempotency_key, action)
+
+    def cancel_handover(self, handover_id: str, *, actor: str) -> dict:
+        try:
+            handover = self.handovers.cancel(handover_id, actor=actor)
+        except NotFound:
+            raise ServiceError('handover_not_found', f'unknown handover {handover_id}', 404) from None
+        return {'handover': handover.to_dict(), 'applied': True}
+
+    def get_handover(self, handover_id: str) -> dict:
+        try:
+            return self.handovers.get(handover_id).to_dict()
+        except NotFound:
+            raise ServiceError('handover_not_found', f'unknown handover {handover_id}', 404) from None
+
+    def list_handovers(self, *, robot: str | None = None, state: str | None = None,
+                       to_operator: str | None = None) -> list[dict]:
+        return [h.to_dict() for h in self.handovers.list_handovers(
+            robot=robot, state=state, to_operator=to_operator)]
+
+    def report_mission_progress(self, mission_id: str, waypoint_index: int, *,
+                                position=None, note: str = '', actor: str = 'robot') -> dict:
+        def action() -> dict:
+            try:
+                mission = self.missions.report_progress(mission_id, waypoint_index=waypoint_index,
+                                                        position=position, note=note, actor=actor)
+            except NotFound:
+                raise ServiceError('mission_not_found', f'unknown mission {mission_id}', 404) from None
+            return {'mission': mission.to_dict(), 'applied': True}
+
+        return self._idempotent(f'{mission_id}:progress', None, action)
+
     # -- operations ------------------------------------------------------------
     def health(self) -> dict:
         breaks = self.audit.verify()
         expired = self.sessions.expire()
+        expired_offers = self.handovers.expire()
         states: dict[str, int] = {}
         for mission in self.missions.list_missions():
             states[mission.state] = states.get(mission.state, 0) + 1
@@ -126,6 +185,8 @@ class PlatformService:
             'audit_chain': {'ok': not breaks, 'breaks': [b.__dict__ for b in breaks]},
             'sessions': {'ok': True, 'active': len(self.sessions.list_sessions(state='active')),
                          'expired_now': len(expired)},
+            'handovers': {'ok': True, 'pending': len(self.handovers.list_handovers(state=PENDING)),
+                          'expired_now': len(expired_offers)},
             'events': {'ok': True, 'tail_seq': None if tail is None else tail.seq},
         }
         return {'status': 'ok' if all(c['ok'] for c in checks.values()) else 'degraded',
@@ -152,6 +213,8 @@ class PlatformService:
                                f'expected revision {exc.expected}, found {exc.actual}', 409) from None
         except InvalidTransition as exc:
             raise ServiceError('invalid_transition', str(exc), 409) from None
+        except HandoverError as exc:
+            raise ServiceError('handover_conflict', str(exc), 409) from None
         except MissionError as exc:
             raise ServiceError('mission_error', str(exc), 422) from None
         except MapFormatError as exc:

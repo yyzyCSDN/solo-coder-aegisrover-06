@@ -32,6 +32,30 @@ class SessionRequest(BaseModel):
     lease_seconds: float = 30.0
 
 
+class HandoverOfferRequest(BaseModel):
+    robot: str
+    to_operator: str
+    actor: str
+    note: str = ''
+    ttl_seconds: float = 900.0
+
+
+class HandoverAcceptRequest(BaseModel):
+    actor: str
+    lease_seconds: float = 30.0
+
+
+class HandoverCancelRequest(BaseModel):
+    actor: str
+
+
+class ProgressRequest(BaseModel):
+    waypoint_index: int
+    position: tuple[float, float] | None = None
+    note: str = ''
+    actor: str = 'robot'
+
+
 class MapRequest(BaseModel):
     cells: dict[str, int]
     if_match: int | None = None
@@ -110,6 +134,42 @@ def get_mission(mission_id: str):
 @app.post('/v1/sessions')
 def open_session(req: SessionRequest):
     return _guard(lambda: service.open_session(req.robot, req.operator, lease_seconds=req.lease_seconds))
+
+
+@app.post('/v1/missions/{mission_id}/progress')
+def report_progress(mission_id: str, req: ProgressRequest):
+    return _guard(lambda: service.report_mission_progress(
+        mission_id, req.waypoint_index, position=req.position, note=req.note, actor=req.actor))
+
+
+@app.post('/v1/handovers')
+def offer_handover(req: HandoverOfferRequest, idempotency_key: str | None = None):
+    return _guard(lambda: service.offer_handover(
+        req.robot, req.to_operator, actor=req.actor, note=req.note,
+        ttl_seconds=req.ttl_seconds, idempotency_key=idempotency_key))
+
+
+@app.get('/v1/handovers')
+def list_handovers(robot: str | None = None, state: str | None = None,
+                   to_operator: str | None = None):
+    return service.list_handovers(robot=robot, state=state, to_operator=to_operator)
+
+
+@app.get('/v1/handovers/{handover_id}')
+def get_handover(handover_id: str):
+    return _guard(lambda: service.get_handover(handover_id))
+
+
+@app.post('/v1/handovers/{handover_id}/accept')
+def accept_handover(handover_id: str, req: HandoverAcceptRequest, idempotency_key: str | None = None):
+    return _guard(lambda: service.accept_handover(
+        handover_id, actor=req.actor, lease_seconds=req.lease_seconds,
+        idempotency_key=idempotency_key))
+
+
+@app.post('/v1/handovers/{handover_id}/cancel')
+def cancel_handover(handover_id: str, req: HandoverCancelRequest):
+    return _guard(lambda: service.cancel_handover(handover_id, actor=req.actor))
 
 
 @app.post('/v1/maps/{map_id}')

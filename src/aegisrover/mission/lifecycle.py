@@ -64,6 +64,7 @@ class Mission:
     revision: int = 1
     created_at: float = 0.0
     updated_at: float = 0.0
+    progress: dict | None = None
     labels: dict[str, str] = field(default_factory=dict)
     history: tuple[dict[str, Any], ...] = ()
 
@@ -79,6 +80,7 @@ class Mission:
             'revision': self.revision,
             'created_at': self.created_at,
             'updated_at': self.updated_at,
+            'progress': None if self.progress is None else dict(self.progress),
             'labels': dict(self.labels),
             'history': [dict(h) for h in self.history],
         }
@@ -96,6 +98,7 @@ class Mission:
             revision=int(payload.get('revision', 1)),
             created_at=float(payload.get('created_at', 0.0)),
             updated_at=float(payload.get('updated_at', 0.0)),
+            progress=dict(payload['progress']) if payload.get('progress') else None,
             labels=dict(payload.get('labels') or {}),
             history=tuple(payload.get('history') or ()),
         )
@@ -175,6 +178,46 @@ class MissionService:
         self._audit.append(actor, f'mission.{command}', mission_id,
                            {'from': mission.state, 'to': target, 'reason': reason})
         return {'mission': updated.to_dict(), 'applied': True}
+
+    def report_progress(self, mission_id: str, waypoint_index: int, *,
+                        position: Iterable[float] | None = None, note: str = '',
+                        actor: str = 'robot') -> Mission:
+        """Record where execution currently stands.
+
+        This is the high-frequency telemetry path, so — like session heartbeats —
+        it updates the record without touching the audit chain or the command
+        history; each report simply overwrites ``mission.progress``. The shift
+        handover snapshot reads it to show the next operator exactly which step
+        the mission reached.
+        """
+        record = self._repo.get(MISSION_NAMESPACE, mission_id)
+        mission = Mission.from_dict(record.payload)
+        if mission.state not in ('running', 'paused'):
+            raise InvalidTransition(mission_id, 'report_progress', mission.state)
+        total = len(mission.waypoints)
+        index = int(waypoint_index)
+        if not 0 <= index <= total:
+            raise MissionError(f'waypoint index {index} outside 0..{total}')
+        point = None
+        if position is not None:
+            try:
+                x, y = position
+                point = (float(x), float(y))
+            except (TypeError, ValueError):
+                raise MissionError('position must be a pair of numbers') from None
+        now = self._clock()
+        progress = {
+            'waypoint_index': index,
+            'waypoints_total': total,
+            'position': point,
+            'note': note,
+            'reported_at': now,
+            'reported_by': actor,
+        }
+        updated = replace(mission, progress=progress, revision=mission.revision + 1,
+                          updated_at=now)
+        self._repo.put(MISSION_NAMESPACE, mission_id, updated.to_dict(), expected=record.version)
+        return updated
 
     # -- reads -----------------------------------------------------------------
     def get(self, mission_id: str) -> Mission:
