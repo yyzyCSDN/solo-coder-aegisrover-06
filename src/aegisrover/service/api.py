@@ -32,6 +32,17 @@ class SessionRequest(BaseModel):
     lease_seconds: float = 30.0
 
 
+class HandoverRequest(BaseModel):
+    to_operator: str
+    note: str = ''
+    ttl_seconds: float = Field(default=300.0, gt=0)
+
+
+class HandoverActionRequest(BaseModel):
+    operator: str
+    reason: str = ''
+
+
 class MapRequest(BaseModel):
     cells: dict[str, int]
     if_match: int | None = None
@@ -110,6 +121,38 @@ def get_mission(mission_id: str):
 @app.post('/v1/sessions')
 def open_session(req: SessionRequest):
     return _guard(lambda: service.open_session(req.robot, req.operator, lease_seconds=req.lease_seconds))
+
+
+@app.post('/v1/robots/{robot}/handovers')
+def initiate_handover(robot: str, req: HandoverRequest):
+    return _guard(lambda: service.initiate_handover(
+        robot, req.to_operator, note=req.note, ttl_seconds=req.ttl_seconds))
+
+
+@app.get('/v1/robots/{robot}/handovers')
+def list_handovers(robot: str):
+    return _guard(lambda: service.list_handovers(robot=robot))
+
+
+@app.get('/v1/robots/{robot}/briefing')
+def handover_briefing(robot: str):
+    return _guard(lambda: service.handover_briefing(robot))
+
+
+@app.post('/v1/handovers/{handover_id}/accept')
+def accept_handover(handover_id: str, req: HandoverActionRequest):
+    return _guard(lambda: service.accept_handover(handover_id, actor=req.operator))
+
+
+@app.post('/v1/handovers/{handover_id}/reject')
+def reject_handover(handover_id: str, req: HandoverActionRequest):
+    return _guard(lambda: service.reject_handover(handover_id, actor=req.operator,
+                                                  reason=req.reason))
+
+
+@app.post('/v1/handovers/{handover_id}/cancel')
+def cancel_handover(handover_id: str, req: HandoverActionRequest):
+    return _guard(lambda: service.cancel_handover(handover_id, actor=req.operator))
 
 
 @app.post('/v1/maps/{map_id}')

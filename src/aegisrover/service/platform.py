@@ -15,7 +15,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from aegisrover.mission.lifecycle import InvalidTransition, MissionError, MissionService
+from aegisrover.mission.progress import ProgressStore
 from aegisrover.mapping.revisions import MapFormatError, MapRepository, MapRevision
+from aegisrover.runtime.handover import HandoverError, HandoverManager
 from aegisrover.runtime.session import SessionError, SessionRegistry
 from aegisrover.storage.audit import AuditLog
 from aegisrover.storage.event_store import EventStore
@@ -48,6 +50,9 @@ class PlatformService:
         self.audit = AuditLog(repository, clock)
         self.missions = MissionService(repository, self.audit, clock)
         self.sessions = SessionRegistry(repository, self.audit, clock)
+        self.progress = ProgressStore(repository, clock)
+        self.handovers = HandoverManager(repository, self.sessions, self.progress,
+                                         self.audit, clock)
         self.maps = MapRepository(repository, self.audit, clock)
         self.events = EventStore(repository, clock)
 
@@ -66,6 +71,11 @@ class PlatformService:
                         expected_revision: int | None = None, assignee: str | None = None,
                         idempotency_key: str | None = None) -> dict:
         def action() -> dict:
+            try:
+                mission = self.missions.get(mission_id)
+            except NotFound:
+                raise ServiceError('mission_not_found', f'unknown mission {mission_id}', 404) from None
+            self._require_command_authority(mission.assigned_to)
             return self.missions.command(mission_id, command, actor=actor,
                                          expected_revision=expected_revision,
                                          assignee=assignee)
@@ -101,6 +111,9 @@ class PlatformService:
 
     # -- sessions --------------------------------------------------------------
     def open_session(self, robot: str, operator: str, **kwargs) -> dict:
+        if self.handovers.pending_for(robot) is not None:
+            raise ServiceError('handover_pending',
+                               f'{robot} is mid-handover; accept the handover instead', 409)
         try:
             session = self.sessions.open(robot, operator, **kwargs)
         except SessionError as exc:
@@ -113,10 +126,71 @@ class PlatformService:
         except NotFound:
             raise ServiceError('session_not_found', f'unknown session {session_id}', 404) from None
 
+    # -- shift handover ----------------------------------------------------------
+    def initiate_handover(self, robot: str, to_operator: str, *, note: str = '',
+                          ttl_seconds: float = 300.0, actor: str = 'operator') -> dict:
+        try:
+            handover = self.handovers.initiate(robot, to_operator, note=note,
+                                               ttl_seconds=ttl_seconds, actor=actor)
+        except HandoverError as exc:
+            raise ServiceError('handover_error', str(exc), 409) from None
+        return {'handover': handover.to_dict(), 'applied': True}
+
+    def accept_handover(self, handover_id: str, *, actor: str, **session_kwargs) -> dict:
+        try:
+            handover, session = self.handovers.accept(handover_id, actor=actor, **session_kwargs)
+        except HandoverError as exc:
+            raise ServiceError('handover_error', str(exc), 409) from None
+        return {'handover': handover.to_dict(), 'session': session.to_dict(), 'applied': True}
+
+    def reject_handover(self, handover_id: str, *, actor: str, reason: str = '') -> dict:
+        try:
+            handover = self.handovers.reject(handover_id, actor=actor, reason=reason)
+        except HandoverError as exc:
+            raise ServiceError('handover_error', str(exc), 409) from None
+        return {'handover': handover.to_dict(), 'applied': True}
+
+    def cancel_handover(self, handover_id: str, *, actor: str) -> dict:
+        try:
+            handover = self.handovers.cancel(handover_id, actor=actor)
+        except HandoverError as exc:
+            raise ServiceError('handover_error', str(exc), 409) from None
+        return {'handover': handover.to_dict(), 'applied': True}
+
+    def handover_briefing(self, robot: str) -> dict:
+        """What the incoming shift reads before accepting: holder, pending
+        handover, and the waypoint each in-flight mission has reached."""
+        briefing = self.handovers.briefing(robot)
+        for line in briefing['missions']:
+            try:
+                mission = self.missions.get(line['mission_id'])
+            except NotFound:
+                continue
+            line['mission_state'] = mission.state
+            line['priority'] = mission.priority
+        return briefing
+
+    def list_handovers(self, *, robot: str | None = None) -> list[dict]:
+        return [h.to_dict() for h in self.handovers.list_handovers(robot=robot)]
+
+    def _require_command_authority(self, robot: str | None) -> None:
+        """Freeze operator commands on a robot while its handover is pending.
+
+        The robot keeps running its mission autonomously; neither the outgoing
+        nor the incoming console may issue commands until the handover
+        resolves, so the robot can never have two commanders at once.
+        """
+        if robot is None:
+            return
+        if self.handovers.pending_for(robot) is not None:
+            raise ServiceError('handover_pending',
+                               f'{robot} is mid-handover; operator commands are frozen', 409)
+
     # -- operations ------------------------------------------------------------
     def health(self) -> dict:
         breaks = self.audit.verify()
         expired = self.sessions.expire()
+        lapsed_handovers = self.handovers.expire()
         states: dict[str, int] = {}
         for mission in self.missions.list_missions():
             states[mission.state] = states.get(mission.state, 0) + 1
@@ -126,6 +200,9 @@ class PlatformService:
             'audit_chain': {'ok': not breaks, 'breaks': [b.__dict__ for b in breaks]},
             'sessions': {'ok': True, 'active': len(self.sessions.list_sessions(state='active')),
                          'expired_now': len(expired)},
+            'handovers': {'ok': True,
+                          'pending': len(self.handovers.list_handovers(state='pending')),
+                          'expired_now': len(lapsed_handovers)},
             'events': {'ok': True, 'tail_seq': None if tail is None else tail.seq},
         }
         return {'status': 'ok' if all(c['ok'] for c in checks.values()) else 'degraded',
